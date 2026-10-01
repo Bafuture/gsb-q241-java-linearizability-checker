@@ -30,3 +30,81 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 241）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明（本次迭代新增）
+
+### 模块结构
+
+```
+com.example.gsb.lincheck
+├── model     Operation（调用/返回时间、方法、参数、返回值）、History
+├── spec      SequentialSpec 顺序规约接口；内置 CounterSpec / QueueSpec
+├── check     LinearizabilityChecker、SequentialConsistencyChecker、
+│             ConflictMinimizer（ddmin）、CheckReport、Stats、Verdict
+├── harness   HistoryRecorder、ExecutionDriver（真实多线程执行并记录历史）、
+│             SynchronizedCounter / SynchronizedQueue（正确实现）、
+│             GatedRacyCounter（用栅栏确定性制造非线性一致历史的错误实现）
+└── Main      端到端演示：真实执行 → 记录 → 检查 → 打印报告
+```
+
+### 判定算法（要求 3）
+
+**线性一致性**（Herlihy–Wing）：历史可线性化，当且仅当存在操作的全序 π，使得
+(a) π 与实时偏序相容（`a.responseTime < b.invocationTime` ⟹ a 排在 b 前）；
+(b) 按 π 串行重放顺序规约，每个操作的实际返回值都被接受。
+
+不枚举 n! 全排列，而是采用 **Wing–Gong 事件扫描回溯**：
+
+1. 把 2n 个调用/返回事件按时间排序（时间相同则调用先于返回，使零长度操作可在其唯一时刻线性化）。
+2. DFS 扫描事件：遇到调用事件，操作进入"待线性化"集合 `calls`；遇到返回事件时，
+   必须在该时刻之前（含）把该操作线性化——即**每个操作只能在其活跃区间
+   `[invocationTime, responseTime]` 内被线性化**。这就是区间约束剪枝：
+   所有违反实时偏序的排列在生成前就被剪掉，根本不会进入搜索。
+3. 在返回事件点，可线性化 `calls` 中任意一个挂起操作（规约 `step` 拒绝则剪枝，
+   计入 `specRejections`）。
+4. **记忆化**：搜索状态以三元组 `(事件位置, calls 集合, 抽象规约状态)` 为键。
+   不同的线性化前缀若收敛到同一三元组，则未来可能性完全相同，
+   第二次到达直接剪枝（计入 `memoHits`）。
+
+**复杂度**：设最大并发度（任意时刻活跃操作数）为 `c`，可达抽象状态数为 `|S|`。
+记忆化键总数不超过 `2n · 2^c · |S|`，每个键至多展开一次，因此
+时间复杂度为 `O(n · 2^c · |S| · step)`：低竞争历史（c 小）下接近线性；
+一般问题本身 NP 难，最坏情况指数不可避免。检查器提供节点预算
+（`withMaxNodes`），超限返回 `INCONCLUSIVE` 而非挂死。
+
+**顺序一致性**（Lamport）：与线性一致性唯一的区别是偏序——只保留
+**线程内程序序**（同线程操作按调用先后排序），允许跨线程操作越过实时顺序重排。
+因此"线性一致 ⟹ 顺序一致"，反之不然；测试中用经典 Herlihy–Wing 队列历史
+（`enq(x)` 实时先于 `enq(y)`，却 `deq()` 返回 `y`）区分两种一致性。
+
+### 反例与最小冲突集（要求 4）
+
+判定不一致时，用 **ddmin 增量调试**（Zeller）以检查器本身为预言机，
+反复二分/补集删除操作，输出 **1-极小冲突集**：该子集本身仍不一致，
+但再删掉任意一个操作就一致。报告中逐条列出这些无法排序的操作
+（含线程、方法、参数、返回值与时间区间）。
+
+### 统计（要求 7）
+
+`CheckReport.stats()` 提供：操作数 `operations`、搜索节点数 `nodes`、
+判定耗时 `elapsedNanos`、剪枝命中数（`memoHits` 记忆化命中 +
+`specRejections` 规约拒绝）。`CheckReport.describe()` 输出人类可读报告。
+
+### 使用示例
+
+```java
+History history = ...; // 手工构造，或由 ExecutionDriver 记录真实执行
+CheckReport report = new LinearizabilityChecker<>(new CounterSpec()).check(history);
+if (report.verdict() == Verdict.INCONSISTENT) {
+    System.out.println(report.describe()); // 含最小冲突集
+}
+
+// 真实执行自动校验
+SynchronizedCounter counter = new SynchronizedCounter();
+History h = ExecutionDriver.run(4, (i, name, rec) -> {
+    for (int k = 0; k < 25; k++) rec.record(name, "inc", null, counter::incrementAndGet);
+});
+assert new LinearizabilityChecker<>(new CounterSpec()).check(h).isConsistent();
+```
