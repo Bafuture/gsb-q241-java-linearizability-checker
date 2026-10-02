@@ -30,3 +30,57 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 241）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明（本次交付）
+
+### 功能
+
+- **历史输入**：`Operation`（调用时间、返回时间、进程、操作类型、参数、返回值）+ `History`。
+- **线性一致性判定**：`Checker.checkLinearizable(history, spec)`，成功时返回见证排序 `witnessOrder`。
+- **顺序一致性判定**：`Checker.checkSequentiallyConsistent(...)`，用于区分 SC 与 LC
+  （见 `LinearizabilityCheckerTest#sequentiallyConsistentButNotLinearizable`）。
+- **反例输出**：不一致时返回 `minimalConflict` —— 一个 1-最小冲突集合：
+  该子集本身仍不可串行化，但移除其中任意一个操作后就可串行化。
+- **统计**：`CheckStats` 含操作数、搜索节点数、剪枝命中数（区间约束 / 返回值）、
+  记忆化命中数与判定耗时。
+- **内置实现自动校验**：`ConcurrentCounter` / `ConcurrentQueue` 配合
+  `OperationRecorder`（`RecordingCounter` / `RecordingQueue`）把真实并发执行
+  记录成历史后送入检查器（见 `ConcurrentStructuresTest`）。
+- **内置顺序规约**：`CounterSpec`、`QueueSpec`、`RegisterSpec`。
+
+### 算法
+
+采用 Wing & Gong (1993) 风格的回溯搜索：
+
+1. **前驱约束**：线性一致性下，若 `a.response < b.invoke` 则 `a` 必须排在 `b` 前
+   （实时序）；顺序一致性下，同进程内按程序序约束。
+2. **区间约束剪枝**：每个搜索节点只尝试所有前驱均已线性化的操作，而不是枚举
+   全部 `n!` 种排列。
+3. **返回值剪枝**：候选操作在顺序规约状态机上执行，规约返回值与记录返回值
+   不一致立即剪枝。
+4. **记忆化**：缓存已证明失败的 `(规约状态, 已线性化集合)` 对，每对至多展开一次。
+5. **最小冲突集合**：判定失败后用贪心删除做 1-最小化（`O(n)` 次子检查）。
+
+### 复杂度
+
+- 朴素全排列为 `O(n!)`；记忆化后上界为子集格 `O(2^n · n)` 次规约步进。
+- 区间基本不重叠的历史上，前驱剪枝使每节点只剩一个候选，实际接近 `O(n)`。
+- 冲突最小化额外进行 `O(n)` 次子检查。
+- 工程限制：搜索节点使用 64 位位掩码，单个历史最多 64 个操作
+  （`History.MAX_OPERATIONS`）。
+
+### 代码结构
+
+```
+com.example.gsb.lin
+├── Operation / History          历史数据模型
+├── SequentialSpec               顺序规约接口（状态机）
+├── Checker                      搜索引擎（LC / SC 两种模式）
+├── CheckResult / CheckStats     结果与统计
+├── ConsistencyModel             一致性模型枚举
+├── ConcurrentCounter / ConcurrentQueue   内置并发实现
+├── spec/                        CounterSpec / QueueSpec / RegisterSpec
+└── recorder/                    OperationRecorder 及 Recording* 包装器
+```
